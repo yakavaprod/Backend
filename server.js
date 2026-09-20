@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
+import { OAuth2Client } from 'google-auth-library';
 
 dotenv.config();
 
@@ -11,6 +12,8 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'development-only-change-me';
 const MONGODB_URI = process.env.MONGODB_URI;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 if (!MONGODB_URI) throw new Error('MONGODB_URI is required. Copy backend/.env.example to backend/.env and configure it.');
 dns.setServers((process.env.DNS_SERVERS || '1.1.1.1,8.8.8.8').split(',').map((server) => server.trim()));
 if (process.env.NODE_ENV === 'production' && JWT_SECRET === 'development-only-change-me') {
@@ -116,6 +119,22 @@ const couponSchema = new mongoose.Schema({
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
 }, { timestamps: true });
 
+const supportTicketSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true },
+  email: { type: String, required: true, trim: true, lowercase: true },
+  category: { type: String, enum: ['login', 'account', 'payment', 'product', 'delivery', 'technical', 'other'], default: 'other' },
+  subject: { type: String, required: true, trim: true },
+  message: { type: String, required: true, trim: true },
+  sourceUrl: { type: String, default: '', trim: true },
+  userAgent: { type: String, default: '', trim: true },
+  status: { type: String, enum: ['open', 'pending', 'resolved'], default: 'open' },
+  replies: [{
+    sender: { type: String, enum: ['user', 'admin'], required: true },
+    message: { type: String, required: true, trim: true },
+    createdAt: { type: Date, default: Date.now },
+  }],
+}, { timestamps: true });
+
 const User = mongoose.model('User', userSchema);
 const Product = mongoose.model('Product', productSchema);
 const Cart = mongoose.model('Cart', cartSchema);
@@ -124,6 +143,7 @@ const Review = mongoose.model('Review', reviewSchema);
 const Coupon = mongoose.model('Coupon', couponSchema);
 const Post = mongoose.model('Post', postSchema);
 const Comment = mongoose.model('Comment', commentSchema);
+const SupportTicket = mongoose.model('SupportTicket', supportTicketSchema);
 
 const publicUser = (user) => ({
   id: user._id,
@@ -226,6 +246,100 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
   if (!user || !validPassword(req.body.password || '', user.passwordHash) || user.status !== 'active') return res.status(401).json({ error: 'Invalid email or password' });
   res.json({ token: signToken(user), user: publicUser(user) });
 }));
+
+app.post('/api/auth/google', asyncRoute(async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'Google token is required' });
+  if (!GOOGLE_CLIENT_ID) return res.status(500).json({ error: 'Google OAuth is not configured on the server.' });
+
+  const ticket = await googleClient.verifyIdToken({
+    idToken: token,
+    audience: GOOGLE_CLIENT_ID,
+  });
+
+  const payload = ticket.getPayload();
+  if (!payload?.email) return res.status(400).json({ error: 'Google account email is unavailable.' });
+
+  const email = payload.email.toLowerCase().trim();
+  let user = await User.findOne({ email });
+
+  if (!user) {
+    const generated = hashPassword(`${Date.now()}-${Math.random().toString(36).slice(2)}-${email}`);
+    user = await User.create({
+      name: payload.name?.trim() || payload.given_name || email.split('@')[0],
+      email,
+      passwordHash: `${generated.salt}:${generated.hash}`,
+      role: 'customer',
+      avatarUrl: payload.picture || '',
+      verified: true,
+    });
+  } else {
+    if (payload.name && user.name !== payload.name.trim()) user.name = payload.name.trim();
+    if (payload.picture) user.avatarUrl = payload.picture;
+    user.verified = true;
+    await user.save();
+  }
+
+  res.json({ token: signToken(user), user: publicUser(user) });
+}));
+
+app.post('/api/support/tickets', asyncRoute(async (req, res) => {
+  const { name, email, category, subject, message, sourceUrl, userAgent } = req.body || {};
+  if (!name || !email || !subject || !message) {
+    return res.status(400).json({ error: 'Name, email, subject and message are required.' });
+  }
+
+  const ticket = await SupportTicket.create({
+    name: String(name).trim(),
+    email: String(email).trim().toLowerCase(),
+    category: ['login', 'account', 'payment', 'product', 'delivery', 'technical', 'other'].includes(category) ? category : 'other',
+    subject: String(subject).trim(),
+    message: String(message).trim(),
+    sourceUrl: sourceUrl ? String(sourceUrl).trim() : '',
+    userAgent: userAgent ? String(userAgent).trim() : '',
+  });
+
+  res.status(201).json({
+    message: 'Your support request was sent successfully. Our admin team will review it soon.',
+    ticketId: ticket._id,
+  });
+}));
+
+app.get('/api/admin/support-tickets', auth, admin, asyncRoute(async (req, res) => {
+  const tickets = await SupportTicket.find().sort({ createdAt: -1 }).lean();
+  res.json(tickets);
+}));
+
+app.get('/api/support/tickets', asyncRoute(async (req, res) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: 'Email is required to check your support history.' });
+
+  const tickets = await SupportTicket.find({ email }).sort({ createdAt: -1 }).lean();
+  res.json(tickets);
+}));
+
+app.get('/api/admin/support-tickets/:id', auth, admin, asyncRoute(async (req, res) => {
+  const ticket = await SupportTicket.findById(req.params.id).lean();
+  if (!ticket) return res.status(404).json({ error: 'Support ticket not found.' });
+  res.json(ticket);
+}));
+
+app.post('/api/admin/support-tickets/:id/replies', auth, admin, asyncRoute(async (req, res) => {
+  const { message, status } = req.body || {};
+  const ticket = await SupportTicket.findById(req.params.id);
+  if (!ticket) return res.status(404).json({ error: 'Support ticket not found.' });
+
+  const replyText = String(message || '').trim();
+  if (!replyText) return res.status(400).json({ error: 'Reply message is required.' });
+
+  ticket.replies.push({ sender: 'admin', message: replyText });
+  if (status && ['open', 'pending', 'resolved'].includes(status)) ticket.status = status;
+  if (ticket.status === 'open' && status !== 'resolved') ticket.status = 'pending';
+  await ticket.save();
+
+  res.json({ message: 'Reply sent successfully.', ticket });
+}));
+
 app.get('/api/auth/me', auth, (req, res) => res.json({ user: publicUser(req.user) }));
 app.patch('/api/settings/profile', auth, asyncRoute(async (req, res) => {
   const { name, email, phone, country, avatarUrl } = req.body;
