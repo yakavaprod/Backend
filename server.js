@@ -64,8 +64,11 @@ const cartSchema = new mongoose.Schema({
 const orderSchema = new mongoose.Schema({
   orderNumber: { type: String, unique: true, index: true },
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  items: [{ product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' }, title: String, quantity: Number, unitPrice: Number }],
+  items: [{ product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' }, title: String, quantity: Number, unitPrice: Number, discountPercent: { type: Number, default: 0 } }],
   total: { type: Number, required: true },
+  discountCode: { type: String, default: '', trim: true },
+  discountPercent: { type: Number, default: 0, min: 0, max: 100 },
+  discountAmount: { type: Number, default: 0, min: 0 },
   status: { type: String, enum: ['pending', 'paid', 'cancelled'], default: 'pending' },
   paymentMethod: { type: String, enum: ['momo'], default: 'momo' },
   billing: { fullName: String, email: String, phone: String, country: String, state: String, zip: String },
@@ -100,11 +103,25 @@ const commentSchema = new mongoose.Schema({
   likes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
 }, { timestamps: true });
 
+const couponSchema = new mongoose.Schema({
+  code: { type: String, required: true, unique: true, uppercase: true, trim: true, index: true },
+  description: { type: String, default: '', trim: true },
+  product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true, index: true },
+  discountPercent: { type: Number, required: true, min: 1, max: 100 },
+  maxUses: { type: Number, default: 0, min: 0 },
+  usedCount: { type: Number, default: 0, min: 0 },
+  status: { type: String, enum: ['active', 'inactive'], default: 'active' },
+  validFrom: { type: Date, default: null },
+  validTo: { type: Date, default: null },
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+}, { timestamps: true });
+
 const User = mongoose.model('User', userSchema);
 const Product = mongoose.model('Product', productSchema);
 const Cart = mongoose.model('Cart', cartSchema);
 const Order = mongoose.model('Order', orderSchema);
 const Review = mongoose.model('Review', reviewSchema);
+const Coupon = mongoose.model('Coupon', couponSchema);
 const Post = mongoose.model('Post', postSchema);
 const Comment = mongoose.model('Comment', commentSchema);
 
@@ -183,6 +200,14 @@ const validPassword = (password, stored) => {
   const derived = crypto.scryptSync(password, salt, 64).toString('hex');
   return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(derived, 'hex'));
 };
+const isCouponActive = (coupon, currentDate = new Date()) => {
+  if (coupon.status !== 'active') return false;
+  if (coupon.validFrom && currentDate < new Date(coupon.validFrom)) return false;
+  if (coupon.validTo && currentDate > new Date(coupon.validTo)) return false;
+  if (coupon.maxUses > 0 && coupon.usedCount >= coupon.maxUses) return false;
+  return true;
+};
+
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok', database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
@@ -251,6 +276,21 @@ app.get('/api/products/:id', asyncRoute(async (req, res) => {
   res.json({ ...product, reviews });
 }));
 
+app.post('/api/coupons/validate', auth, asyncRoute(async (req, res) => {
+  const code = String(req.body.code || '').trim().toUpperCase();
+  const productId = req.body.productId;
+  if (!code || !productId) return res.status(400).json({ error: 'Coupon code and product are required' });
+
+  const product = await Product.findOne({ _id: productId, status: 'published' });
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+
+  const coupon = await Coupon.findOne({ code, product: productId });
+  if (!coupon) return res.status(404).json({ error: 'Coupon code is not valid for this product' });
+  if (!isCouponActive(coupon)) return res.status(400).json({ error: 'This coupon is expired or no longer active' });
+
+  res.json({ valid: true, code: coupon.code, productId: coupon.product.toString(), discountPercent: coupon.discountPercent, description: coupon.description || 'Product discount' });
+}));
+
 app.get('/api/cart', auth, asyncRoute(async (req, res) => res.json(await Cart.findOne({ user: req.user._id }).populate('items.product').lean() || { items: [] })));
 app.post('/api/cart/items', auth, asyncRoute(async (req, res) => {
   const product = await Product.findOne({ _id: req.body.productId, status: 'published' });
@@ -271,11 +311,48 @@ app.delete('/api/cart/items/:productId', auth, asyncRoute(async (req, res) => {
 app.post('/api/orders', auth, asyncRoute(async (req, res) => {
   const requested = Array.isArray(req.body.items) ? req.body.items : [{ productId: req.body.productId, quantity: req.body.quantity }];
   if (!requested.length) return res.status(400).json({ error: 'At least one product is required' });
+
   const products = await Product.find({ _id: { $in: requested.map((item) => item.productId) }, status: 'published' });
   if (products.length !== requested.length) return res.status(400).json({ error: 'One or more products are unavailable' });
-  const items = requested.map((item) => { const product = products.find((entry) => entry._id.toString() === item.productId); const quantity = Math.max(1, Number(item.quantity) || 1); return { product: product._id, title: product.title, quantity, unitPrice: +(product.price * (1 - product.discount / 100)).toFixed(2) }; });
+
+  const normalizedCode = String(req.body.promoCode || '').trim().toUpperCase();
+  const items = [];
+  let totalDiscountAmount = 0;
+  let appliedDiscountPercent = 0;
+
+  for (const item of requested) {
+    const product = products.find((entry) => entry._id.toString() === item.productId);
+    const quantity = Math.max(1, Number(item.quantity) || 1);
+    const productPriceBeforeDiscount = +(product.price * (1 - product.discount / 100)).toFixed(2);
+
+    let itemDiscountPercent = 0;
+    if (normalizedCode) {
+      const coupon = await Coupon.findOne({ code: normalizedCode, product: product._id, status: 'active' });
+      if (coupon && isCouponActive(coupon)) {
+        itemDiscountPercent = coupon.discountPercent;
+        appliedDiscountPercent = Math.max(appliedDiscountPercent, coupon.discountPercent);
+        if (coupon.maxUses > 0) {
+          await Coupon.findByIdAndUpdate(coupon._id, { $inc: { usedCount: 1 } });
+        }
+      }
+    }
+
+    const unitPrice = +(productPriceBeforeDiscount * (1 - itemDiscountPercent / 100)).toFixed(2);
+    totalDiscountAmount += (productPriceBeforeDiscount - unitPrice) * quantity;
+    items.push({ product: product._id, title: product.title, quantity, unitPrice, discountPercent: itemDiscountPercent });
+  }
+
   const total = +items.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0).toFixed(2);
-  const order = await Order.create({ orderNumber: `ORD-${Date.now().toString().slice(-8)}`, user: req.user._id, items, total, billing: req.body.billing });
+  const order = await Order.create({
+    orderNumber: `ORD-${Date.now().toString().slice(-8)}`,
+    user: req.user._id,
+    items,
+    total,
+    discountCode: normalizedCode || '',
+    discountPercent: appliedDiscountPercent,
+    discountAmount: +totalDiscountAmount.toFixed(2),
+    billing: req.body.billing,
+  });
   res.status(201).json(order);
 }));
 app.get('/api/orders', auth, asyncRoute(async (req, res) => res.json(await Order.find({ user: req.user._id }).sort({ createdAt: -1 }).lean())));
@@ -359,6 +436,72 @@ app.get('/api/admin/posts', auth, admin, asyncRoute(async (req, res) => {
   const posts = await Post.find().populate('author', 'name role verified').sort({ createdAt: -1 });
   res.json(posts.map((post) => publicPost(post, req.user._id)));
 }));
+
+app.get('/api/admin/coupons', auth, admin, asyncRoute(async (req, res) => {
+  const coupons = await Coupon.find().populate('product', 'title category').sort({ createdAt: -1 }).lean();
+  res.json(coupons.map((coupon) => ({
+    _id: coupon._id,
+    code: coupon.code,
+    description: coupon.description,
+    product: coupon.product,
+    productId: coupon.product?._id || coupon.product,
+    discountPercent: coupon.discountPercent,
+    maxUses: coupon.maxUses,
+    usedCount: coupon.usedCount,
+    status: coupon.status,
+    validFrom: coupon.validFrom,
+    validTo: coupon.validTo,
+    createdAt: coupon.createdAt,
+  })));
+}));
+
+app.post('/api/admin/coupons', auth, admin, asyncRoute(async (req, res) => {
+  const code = String(req.body.code || '').trim().toUpperCase();
+  const productId = req.body.productId;
+  const discountPercent = Number(req.body.discountPercent || 0);
+
+  if (!code || !productId || !Number.isFinite(discountPercent) || discountPercent <= 0 || discountPercent > 100) {
+    return res.status(400).json({ error: 'Provide a valid coupon code, product, and discount percentage between 1 and 100.' });
+  }
+
+  const product = await Product.findById(productId);
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+
+  const exists = await Coupon.exists({ code });
+  if (exists) return res.status(409).json({ error: 'This coupon code already exists' });
+
+  const coupon = await Coupon.create({
+    code,
+    description: String(req.body.description || '').trim(),
+    product: productId,
+    discountPercent,
+    maxUses: Number(req.body.maxUses || 0),
+    validFrom: req.body.validFrom ? new Date(req.body.validFrom) : null,
+    validTo: req.body.validTo ? new Date(req.body.validTo) : null,
+    status: req.body.status === 'inactive' ? 'inactive' : 'active',
+    createdBy: req.user._id,
+  });
+
+  res.status(201).json({
+    _id: coupon._id,
+    code: coupon.code,
+    description: coupon.description,
+    productId: coupon.product,
+    discountPercent: coupon.discountPercent,
+    maxUses: coupon.maxUses,
+    usedCount: coupon.usedCount,
+    status: coupon.status,
+    validFrom: coupon.validFrom,
+    validTo: coupon.validTo,
+  });
+}));
+
+app.delete('/api/admin/coupons/:id', auth, admin, asyncRoute(async (req, res) => {
+  const coupon = await Coupon.findByIdAndDelete(req.params.id);
+  if (!coupon) return res.status(404).json({ error: 'Coupon not found' });
+  res.status(204).end();
+}));
+
 app.post('/api/admin/posts', auth, admin, asyncRoute(async (req, res) => {
   const post = await Post.create({ videoUrl: req.body.videoUrl || '', postType: req.body.postType || 'video', isStory: Boolean(req.body.isStory), caption: req.body.caption, status: req.body.status || 'published', author: req.user._id });
   await post.populate('author', 'name role verified');
